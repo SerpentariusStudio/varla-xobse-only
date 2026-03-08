@@ -1,0 +1,4 @@
+LIBRARY	"varla_import"
+EXPORTS
+OBSEPlugin_Query
+OBSEPlugin_Load

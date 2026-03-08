@@ -1,0 +1,25 @@
+# Build output
+Release/
+Debug/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.iobj
+*.ipdb
+*.dll
+*.log
+*.recipe
+*.tlog/
+*.FileListAbsolute.txt
+*.Build.CppClean.log
+
+# Visual Studio
+.vs/
+.vscode/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.cachefile
