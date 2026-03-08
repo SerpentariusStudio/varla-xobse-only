@@ -1,5 +1,7 @@
 # Varla Import — OBSE Plugin for Oblivion Character Transfer
 
+![Varla Stone](stone.png)
+
 An OBSE plugin that imports character data from Oblivion Remastered (or original Oblivion) into The Elder Scrolls IV: Oblivion.
 
 It reads a text-based save dump file and applies the character data to the current player, allowing you to transfer your character between Oblivion Remastered and original Oblivion.
