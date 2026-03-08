@@ -14,6 +14,7 @@
 #include "obse/NiHavokObjects.h"
 #include "obse/NiRTTI.h"
 #include "obse/Tasks.h"
+#include "obse/GameMagicEffects.h"
 
 #define ENABLE_EXTRACT_ARGS_MACROS 1
 OBSEScriptInterface * g_scriptInterface = NULL;
@@ -33,10 +34,1997 @@ OBSEScriptInterface * g_scriptInterface = NULL;
 #include <shlobj.h>
 #include <vector>
 #include <string>
+#include <ctime>
+#include <cmath>
+#include <windows.h>
 
 IDebugLog		gLog("varla_import.log");
 
 PluginHandle			g_pluginHandle = kPluginHandle_Invalid;
+
+// ============================================================================
+// ExportSaveDump - dumps player data to save_dump.txt
+// Copied from Hooks_SaveDump.cpp for standalone plugin use
+// ============================================================================
+
+#ifdef OBLIVION
+
+// ============================================================================
+// varla.ini config support — controls which dump sections are active
+// ============================================================================
+
+static bool GetVarlaIniPath(char* outPath, size_t maxLen)
+{
+	char docsPath[MAX_PATH];
+	if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, docsPath))) {
+		_snprintf_s(outPath, maxLen, _TRUNCATE, "%s\\My Games\\Oblivion\\OBSE\\varla.ini", docsPath);
+		return true;
+	}
+	return false;
+}
+
+static void GenerateDefaultVarlaIni(const char* iniPath)
+{
+	// Ensure directory exists
+	char dirBuf[MAX_PATH];
+	strcpy_s(dirBuf, MAX_PATH, iniPath);
+	char* lastSlash = strrchr(dirBuf, '\\');
+	if (lastSlash) {
+		*lastSlash = '\0';
+		CreateDirectoryA(dirBuf, NULL);
+	}
+
+	FILE* ini = NULL;
+	if (fopen_s(&ini, iniPath, "w") != 0 || !ini) {
+		_MESSAGE("ERROR: Failed to create varla.ini at: %s", iniPath);
+		return;
+	}
+
+	fprintf(ini, "[SaveDump]\r\n");
+	fprintf(ini, "; Controls which sections are included in save_dump.txt\r\n");
+	fprintf(ini, "; Set to 1 to enable a section, 0 to disable\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === Player Character & Identity ===\r\n");
+	fprintf(ini, "bDumpPlayerCharacter=1\r\n");
+	fprintf(ini, "bDumpAppearance=0\r\n");
+	fprintf(ini, "bDumpPosition=0\r\n");
+	fprintf(ini, "bDumpCharacterInfo=0\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === Stats & Progress ===\r\n");
+	fprintf(ini, "bDumpFameInfamy=0\r\n");
+	fprintf(ini, "bDumpGameTime=0\r\n");
+	fprintf(ini, "bDumpGlobalVars=0\r\n");
+	fprintf(ini, "bDumpMiscStats=0\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === Quests ===\r\n");
+	fprintf(ini, "bDumpActiveQuest=0\r\n");
+	fprintf(ini, "bDumpQuestList=0\r\n");
+	fprintf(ini, "bDumpQuestScriptVars=0\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === Character Stats ===\r\n");
+	fprintf(ini, "bDumpFactions=0\r\n");
+	fprintf(ini, "bDumpAttributes=0\r\n");
+	fprintf(ini, "bDumpDerivedStats=0\r\n");
+	fprintf(ini, "bDumpSkills=0\r\n");
+	fprintf(ini, "bDumpMagicResist=0\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === Spells & Magic ===\r\n");
+	fprintf(ini, "bDumpSpells=0\r\n");
+	fprintf(ini, "bDumpInventory=0\r\n");
+	fprintf(ini, "bDumpActiveMagicEffects=0\r\n");
+	fprintf(ini, "bDumpStatusEffects=0\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === Progress & Modifiers ===\r\n");
+	fprintf(ini, "bDumpSkillProgress=0\r\n");
+	fprintf(ini, "bDumpAVModifiers=0\r\n");
+	fprintf(ini, "\r\n");
+	fprintf(ini, "; === World & Misc ===\r\n");
+	fprintf(ini, "bDumpQuickKeys=0\r\n");
+	fprintf(ini, "bDumpCellItems=0\r\n");
+	fprintf(ini, "bDumpPluginList=0\r\n");
+
+	fclose(ini);
+	_MESSAGE("Generated default varla.ini at: %s (bDumpPlayerCharacter=1, 24 flags)", iniPath);
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+static const char* GetWeaponTypeName(UInt32 type)
+{
+	switch (type) {
+	case TESObjectWEAP::kType_BladeOneHand: return "Blade 1H";
+	case TESObjectWEAP::kType_BladeTwoHand: return "Blade 2H";
+	case TESObjectWEAP::kType_BluntOneHand: return "Blunt 1H";
+	case TESObjectWEAP::kType_BluntTwoHand: return "Blunt 2H";
+	case TESObjectWEAP::kType_Staff:        return "Staff";
+	case TESObjectWEAP::kType_Bow:          return "Bow";
+	default:                                return "Unknown";
+	}
+}
+
+static const char* GetMasteryName(UInt32 mastery)
+{
+	switch (mastery) {
+	case 0: return "Novice";
+	case 1: return "Apprentice";
+	case 2: return "Journeyman";
+	case 3: return "Expert";
+	case 4: return "Master";
+	default: return "Unknown";
+	}
+}
+
+static const char* GetItemCategoryName(UInt8 formType)
+{
+	switch (formType) {
+	case kFormType_Weapon:      return "Weapon";
+	case kFormType_Armor:       return "Armor";
+	case kFormType_Clothing:    return "Clothing";
+	case kFormType_Book:        return "Book";
+	case kFormType_Ingredient:  return "Ingredient";
+	case kFormType_Light:       return "Light";
+	case kFormType_Misc:        return "Misc";
+	case kFormType_Key:         return "Key";
+	case kFormType_Ammo:        return "Ammo";
+	case kFormType_SoulGem:     return "SoulGem";
+	case kFormType_AlchemyItem: return "Potion";
+	case kFormType_Apparatus:   return "Apparatus";
+	case kFormType_SigilStone:  return "SigilStone";
+	default:                    return "Other";
+	}
+}
+
+static const char* GetSoulName(UInt8 soul)
+{
+	static const char* names[] = {"Empty", "Petty", "Lesser", "Common", "Greater", "Grand"};
+	if (soul < 6) return names[soul];
+	return "Unknown";
+}
+
+static const char* GetRangeName(UInt32 range)
+{
+	switch (range) {
+	case EffectItem::kRange_Self:   return "Self";
+	case EffectItem::kRange_Touch:  return "Touch";
+	case EffectItem::kRange_Target: return "Target";
+	default:                        return "Unknown";
+	}
+}
+
+static const char* GetSpellTypeName(UInt32 type)
+{
+	switch (type) {
+	case SpellItem::kType_Spell:       return "Spell";
+	case SpellItem::kType_Disease:     return "Disease";
+	case SpellItem::kType_Power:       return "Power";
+	case SpellItem::kType_LesserPower: return "LesserPower";
+	case SpellItem::kType_Ability:     return "Ability";
+	default:                           return "Unknown";
+	}
+}
+
+static const char* GetSpecializationName(UInt32 spec)
+{
+	switch (spec) {
+	case 0: return "Combat";
+	case 1: return "Magic";
+	case 2: return "Stealth";
+	default: return "Unknown";
+	}
+}
+
+static void EffectCodeToStr(UInt32 effectCode, char* outStr)
+{
+	outStr[0] = (char)((effectCode) & 0xFF);
+	outStr[1] = (char)((effectCode >> 8) & 0xFF);
+	outStr[2] = (char)((effectCode >> 16) & 0xFF);
+	outStr[3] = (char)((effectCode >> 24) & 0xFF);
+	outStr[4] = '\0';
+}
+
+static void DumpEnchantmentEffects(FILE* f, EnchantmentItem* ench, const char* indent)
+{
+	if (!ench) return;
+	EffectItemList* effList = &ench->magicItem.list;
+	UInt32 effCount = effList->CountItems();
+	for (UInt32 i = 0; i < effCount; i++) {
+		EffectItem* eff = effList->ItemAt(i);
+		if (!eff) continue;
+
+		char codeStr[5];
+		EffectCodeToStr(eff->effectCode, codeStr);
+
+		const char* effName = "(unknown)";
+		if (eff->setting && eff->setting->fullName.name.m_data)
+			effName = eff->setting->fullName.name.m_data;
+
+		fprintf(f, "%s%s [%s] (%s) Mag: %u Dur: %us",
+			indent, effName, codeStr, GetRangeName(eff->range),
+			eff->magnitude, eff->duration);
+		if (eff->HasActorValue()) {
+			const char* avName = GetActorValueString(eff->GetActorValue());
+			if (avName) fprintf(f, " [%s]", avName);
+		}
+		fprintf(f, "\n");
+	}
+}
+
+static void DumpSpellEffects(FILE* f, SpellItem* spell, const char* indent)
+{
+	if (!spell) return;
+	EffectItemList* effList = &spell->magicItem.list;
+	UInt32 effCount = effList->CountItems();
+	for (UInt32 i = 0; i < effCount; i++) {
+		EffectItem* eff = effList->ItemAt(i);
+		if (!eff) continue;
+
+		char codeStr[5];
+		EffectCodeToStr(eff->effectCode, codeStr);
+
+		const char* effName = "(unknown)";
+		if (eff->setting && eff->setting->fullName.name.m_data)
+			effName = eff->setting->fullName.name.m_data;
+
+		fprintf(f, "%s%s [%s] (%s) Mag: %u Dur: %us",
+			indent, effName, codeStr, GetRangeName(eff->range),
+			eff->magnitude, eff->duration);
+		if (eff->HasActorValue()) {
+			const char* avName = GetActorValueString(eff->GetActorValue());
+			if (avName) fprintf(f, " [%s]", avName);
+		}
+		fprintf(f, "\n");
+	}
+}
+
+static const char* GetMiscStatName(UInt32 index)
+{
+	static const char* names[] = {
+		"Days In Prison",
+		"Days Passed",
+		"Skill Increases",
+		"Training Sessions",
+		"Largest Bounty",
+		"Creatures Killed",
+		"People Killed",
+		"Places Discovered",
+		"Locks Picked",
+		"Lockpicks Broken",
+		"Souls Trapped",
+		"Ingredients Eaten",
+		"Potions Made",
+		"Oblivion Gates Shut",
+		"Horses Owned",
+		"Houses Owned",
+		"Stores Invested In",
+		"Books Read",
+		"Skill Books Read",
+		"Artifacts Found",
+		"Hours Slept",
+		"Hours Waited",
+		"Days As A Vampire",
+		"Last Day As A Vampire",
+		"People Fed On",
+		"Jokes Told",
+		"Diseases Contracted",
+		"Nirnroots Found",
+		"Items Stolen",
+		"Items Pickpocketed",
+		"Trespasses",
+		"Assaults",
+		"Murders",
+		"Horses Stolen",
+	};
+	if (index < PlayerCharacter::kMiscStat_Max)
+		return names[index];
+	return "Unknown";
+}
+
+// ============================================================================
+// Dump Section Functions
+// ============================================================================
+
+static void DumpHeader(FILE* f, const char* savePath, PlayerCharacter* player)
+{
+	fprintf(f, "================================================================================\n");
+	fprintf(f, "xOBSE - SAVE DATA DUMP\n");
+	fprintf(f, "================================================================================\n");
+
+	time_t now = time(NULL);
+	struct tm t;
+	localtime_s(&t, &now);
+	fprintf(f, "Timestamp: %04d-%02d-%02d %02d:%02d:%02d\n",
+		t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+		t.tm_hour, t.tm_min, t.tm_sec);
+	fprintf(f, "Save Path: %s\n", savePath ? savePath : "(null)");
+
+	// Difficulty
+	float d = player->gameDifficultyLevel;
+	const char* label;
+	if (d <= -1.0f)      label = "Very Easy";
+	else if (d <= -0.5f) label = "Easy";
+	else if (d <= 0.0f)  label = "Normal";
+	else if (d <= 0.5f)  label = "Hard";
+	else                 label = "Very Hard";
+	fprintf(f, "Difficulty: %.2f (%s)\n", d, label);
+
+	// Character summary line
+	const char* name = GetFullName(player->baseForm);
+	TESNPC* npc = OBLIVION_CAST(player->baseForm, TESForm, TESNPC);
+	if (npc) {
+		const char* raceName = "(unknown)";
+		const char* className = "(unknown)";
+		if (npc->race.race && npc->race.race->fullName.name.m_data)
+			raceName = npc->race.race->fullName.name.m_data;
+		TESClass* cls = npc->npcClass;
+		if (cls && cls->fullName.name.m_data)
+			className = cls->fullName.name.m_data;
+		fprintf(f, "Character: %s, Level %d %s %s\n",
+			name ? name : "(unknown)",
+			(int)npc->actorBaseData.level,
+			raceName, className);
+	}
+	else {
+		fprintf(f, "Character: %s\n", name ? name : "(unknown)");
+	}
+
+	fprintf(f, "================================================================================\n\n");
+}
+
+static void DumpPlayerCharacter(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== PLAYER CHARACTER ===\n");
+	fprintf(f, "Form ID: 0x%08X\n", player->refID);
+
+	const char* name = GetFullName(player->baseForm);
+	fprintf(f, "Player Name: %s\n", name ? name : "(null)");
+	fprintf(f, "Base Form ID: 0x%08X\n", player->baseForm ? player->baseForm->refID : 0);
+	fprintf(f, "Flags: 0x%08X\n", player->flags);
+	fprintf(f, "\n");
+}
+
+static void DumpPosition(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== POSITION & ROTATION ===\n");
+	fprintf(f, "Position X: %.4f\n", player->posX);
+	fprintf(f, "Position Y: %.4f\n", player->posY);
+	fprintf(f, "Position Z: %.4f\n", player->posZ);
+	fprintf(f, "Rotation X: %.4f (radians) / %.2f (degrees)\n", player->rotX, player->rotX * 180.0f / 3.14159265f);
+	fprintf(f, "Rotation Y: %.4f (radians) / %.2f (degrees)\n", player->rotY, player->rotY * 180.0f / 3.14159265f);
+	fprintf(f, "Rotation Z: %.4f (radians) / %.2f (degrees)\n", player->rotZ, player->rotZ * 180.0f / 3.14159265f);
+	fprintf(f, "Scale: %.4f\n", player->GetScale());
+
+	TESObjectCELL* cell = player->parentCell;
+	if (cell) {
+		const char* cellName = NULL;
+		TESFullName* cellFullName = &cell->fullName;
+		if (cellFullName && cellFullName->name.m_data && cellFullName->name.m_dataLen > 0)
+			cellName = cellFullName->name.m_data;
+		fprintf(f, "Parent Cell: %s (0x%08X)\n", cellName ? cellName : "(unnamed)", cell->refID);
+		fprintf(f, "Cell Type: %s\n", (cell->flags0 & TESObjectCELL::kFlags0_Interior) ? "Interior" : "Exterior");
+	}
+	else {
+		fprintf(f, "Parent Cell: (null)\n");
+	}
+	fprintf(f, "\n");
+}
+
+static void DumpCharacterInfo(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== CHARACTER INFO ===\n");
+
+	TESNPC* npc = OBLIVION_CAST(player->baseForm, TESForm, TESNPC);
+	if (npc) {
+		// Level
+		fprintf(f, "Level: %d\n", (int)npc->actorBaseData.level);
+
+		// Race + racial abilities
+		TESRace* race = npc->race.race;
+		if (race) {
+			fprintf(f, "Race: %s (0x%08X)\n",
+				race->fullName.name.m_data ? race->fullName.name.m_data : "(null)",
+				race->refID);
+			// Racial abilities from race->spells.spellList
+			bool headerPrintedRace = false;
+			int raceSpellIdx = 0;
+			for (TESSpellList::Entry* raceEntry = &race->spells.spellList; raceEntry; raceEntry = raceEntry->next) {
+				TESForm* spellForm = raceEntry->type;
+				if (!spellForm) continue;
+				if (!headerPrintedRace) {
+					fprintf(f, "  Racial Abilities:\n");
+					headerPrintedRace = true;
+				}
+				const char* spellName = GetFullName(spellForm);
+				fprintf(f, "    [%d] %s (0x%08X)\n", raceSpellIdx, spellName ? spellName : "(unknown)", spellForm->refID);
+				raceSpellIdx++;
+			}
+		}
+
+		// Class + details
+		TESClass* cls = npc->npcClass;
+		if (cls) {
+			fprintf(f, "Class: %s (0x%08X)\n",
+				cls->fullName.name.m_data ? cls->fullName.name.m_data : "(null)",
+				cls->refID);
+			fprintf(f, "  Specialization: %s\n", GetSpecializationName(cls->specialization));
+			// Favored attributes
+			const char* attr0 = GetActorValueString(cls->attributes[0]);
+			const char* attr1 = GetActorValueString(cls->attributes[1]);
+			fprintf(f, "  Favored Attributes: %s, %s\n",
+				attr0 ? attr0 : "?", attr1 ? attr1 : "?");
+			// Major skills
+			fprintf(f, "  Major Skills:");
+			for (int i = 0; i < 7; i++) {
+				const char* skillName = GetActorValueString(cls->majorSkills[i]);
+				fprintf(f, " %s", skillName ? skillName : "?");
+				if (i < 6) fprintf(f, ",");
+			}
+			fprintf(f, "\n");
+		}
+
+		// Gender
+		fprintf(f, "Gender: %s\n",
+			(npc->actorBaseData.flags & TESActorBaseData::kFlag_IsFemale) ? "Female" : "Male");
+	}
+
+	// Birthsign + powers
+	BirthSign* sign = player->birthSign;
+	if (sign) {
+		fprintf(f, "Birthsign: %s (0x%08X)\n",
+			sign->fullName.name.m_data ? sign->fullName.name.m_data : "(null)",
+			sign->refID);
+		// Birthsign powers/spells
+		int signSpellIdx = 0;
+		bool headerPrinted = false;
+		for (TESSpellList::Entry* entry = &sign->spellList.spellList; entry; entry = entry->next) {
+			TESForm* spellForm = entry->type;
+			if (!spellForm) continue;
+			if (!headerPrinted) {
+				fprintf(f, "  Powers/Spells:\n");
+				headerPrinted = true;
+			}
+			const char* spellName = GetFullName(spellForm);
+			fprintf(f, "    [%d] %s (0x%08X)\n", signSpellIdx, spellName ? spellName : "(unknown)", spellForm->refID);
+			signSpellIdx++;
+		}
+	}
+
+	// Active spell
+	MagicItem* activeSpell = player->GetActiveMagicItem();
+	if (activeSpell) {
+		const char* spellName = activeSpell->name.m_data;
+		if (!spellName || !spellName[0]) spellName = "(unnamed)";
+
+		// MagicItem -> MagicItemForm -> TESForm to get form ID
+		MagicItemForm* magicForm = OBLIVION_CAST(activeSpell, MagicItem, MagicItemForm);
+		SpellItem* spell = NULL;
+		if (magicForm) spell = OBLIVION_CAST(magicForm, TESForm, SpellItem);
+
+		fprintf(f, "\nActive Spell: %s", spellName);
+		if (magicForm) fprintf(f, " (0x%08X)", magicForm->refID);
+		if (spell) fprintf(f, " [%s]", GetSpellTypeName(spell->spellType));
+		fprintf(f, "\n");
+	}
+
+	// --- Equipped Items --- (sub-section within CharacterInfo)
+	fprintf(f, "\n--- Equipped Items ---\n");
+	{
+		EquippedItemsList equipped = player->GetEquippedItems();
+		if (equipped.empty()) {
+			fprintf(f, "  (none)\n");
+		}
+		else {
+			for (EquippedItemsList::iterator it = equipped.begin(); it != equipped.end(); ++it) {
+				TESForm* item = *it;
+				if (!item) continue;
+				const char* itemName = GetFullName(item);
+
+				// Type-specific details
+				TESObjectWEAP* weapon = OBLIVION_CAST(item, TESForm, TESObjectWEAP);
+				TESObjectARMO* armor = OBLIVION_CAST(item, TESForm, TESObjectARMO);
+
+				if (weapon) {
+					fprintf(f, "  [Weapon] %s (0x%08X) [%s, Dmg:%u, Spd:%.1f, Rch:%.1f]\n",
+						itemName ? itemName : "(null)", item->refID,
+						GetWeaponTypeName(weapon->type),
+						weapon->attackDmg.damage,
+						weapon->speed, weapon->reach);
+				}
+				else if (armor) {
+					fprintf(f, "  [Armor] %s (0x%08X) [%s, AR:%u]\n",
+						itemName ? itemName : "(null)", item->refID,
+						armor->IsHeavyArmor() ? "Heavy" : "Light",
+						(UInt32)armor->armorRating);
+				}
+				else {
+					const char* catName = GetItemCategoryName(item->typeID);
+					fprintf(f, "  [%s] %s (0x%08X)\n",
+						catName, itemName ? itemName : "(null)", item->refID);
+				}
+			}
+		}
+	}
+
+	fprintf(f, "\n");
+}
+
+static void DumpFameInfamyBounty(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== FAME / INFAMY / BOUNTY ===\n");
+	fprintf(f, "Fame: %d\n", player->GetActorValue(kActorVal_Fame));
+	fprintf(f, "Infamy: %d\n", player->GetActorValue(kActorVal_Infamy));
+	fprintf(f, "Bounty: %.0f\n", (float)player->GetActorValue(kActorVal_Bounty));
+	fprintf(f, "\n");
+}
+
+static void DumpGameTime(FILE* f)
+{
+	fprintf(f, "=== GAME TIME ===\n");
+	int daysPassed = TimeGlobals::GameDaysPassed();
+	fprintf(f, "Days Passed: %.2f\n", (float)daysPassed);
+
+	int year = TimeGlobals::GameYear();
+	int month = TimeGlobals::GameMonth();
+	int day = TimeGlobals::GameDay();
+	float hour = TimeGlobals::GameHour();
+	int hourInt = (int)hour;
+	int minuteInt = (int)((hour - hourInt) * 60.0f);
+
+	fprintf(f, "Game Date: Year %d, Month %d, Day %d\n", year, month, day);
+	fprintf(f, "Game Time: %02d:%02d (%.2f)\n", hourInt, minuteInt, hour);
+	fprintf(f, "\n");
+}
+
+static void DumpGlobalVariables(FILE* f)
+{
+	fprintf(f, "=== GLOBAL VARIABLES ===\n");
+	DataHandler* dh = *g_dataHandler;
+	if (!dh) {
+		fprintf(f, "(DataHandler unavailable)\n\n");
+		return;
+	}
+
+	// First pass: count total and time globals
+	int totalCount = 0;
+	int timeGlobalCount = 0;
+	for (tList<TESGlobal>::Iterator iter = dh->globals.Begin(); !iter.End(); ++iter) {
+		TESGlobal* global = iter.Get();
+		if (!global) continue;
+		totalCount++;
+		// Time globals have formIDs 0x35-0x3A
+		if (global->refID >= 0x35 && global->refID <= 0x3A)
+			timeGlobalCount++;
+	}
+
+	fprintf(f, "Total Globals: %d (excluding %d time globals)\n\n",
+		totalCount - timeGlobalCount, timeGlobalCount);
+
+	for (tList<TESGlobal>::Iterator iter = dh->globals.Begin(); !iter.End(); ++iter) {
+		TESGlobal* global = iter.Get();
+		if (!global) continue;
+
+		// Skip time globals
+		if (global->refID >= 0x35 && global->refID <= 0x3A) continue;
+
+		const char* name = global->name.m_data;
+		if (!name || !name[0]) name = "(unnamed)";
+		const char* typeName = "float";
+		switch (global->type) {
+		case TESGlobal::kType_Short: typeName = "short"; break;
+		case TESGlobal::kType_Long:  typeName = "long"; break;
+		case TESGlobal::kType_Float: typeName = "float"; break;
+		}
+		fprintf(f, "  %s (0x%08X) = %.2f [%s]\n", name, global->refID, global->data, typeName);
+	}
+	fprintf(f, "\n");
+}
+
+static void DumpMiscStats(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== MISC STATISTICS ===\n");
+	for (UInt32 i = 0; i < PlayerCharacter::kMiscStat_Max; i++) {
+		// Training Sessions: add remaining this level
+		if (i == PlayerCharacter::kMiscStat_TrainingSessions) {
+			UInt32 used = player->trainingSessionsUsed;
+			UInt32 maxPerLevel = 5;
+			UInt32 remaining = (used < maxPerLevel) ? (maxPerLevel - used) : 0;
+			fprintf(f, "%s: %d (%d remaining this level)\n",
+				GetMiscStatName(i), player->miscStats[i], remaining);
+		}
+		else {
+			fprintf(f, "%s: %d\n", GetMiscStatName(i), player->miscStats[i]);
+		}
+	}
+	fprintf(f, "\n");
+}
+
+static void DumpActiveQuest(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== ACTIVE QUEST ===\n");
+	TESQuest* quest = player->activeQuest;
+	if (quest) {
+		fprintf(f, "Quest Form ID: 0x%08X\n", quest->refID);
+
+		const char* questName = quest->fullName.name.m_data;
+		if (!questName || !questName[0]) questName = "(unnamed)";
+		fprintf(f, "Quest Name: %s\n", questName);
+
+		const char* editorName = quest->editorName.m_data;
+		if (!editorName || !editorName[0]) editorName = "(no editor ID)";
+		fprintf(f, "Quest Editor ID: %s\n", editorName);
+
+		fprintf(f, "Quest Flags: 0x%02X (Active: %s, Completed: %s)\n",
+			quest->questFlags,
+			(quest->questFlags & TESQuest::kQuestFlag_Active) ? "Yes" : "No",
+			quest->IsCompleted() ? "Yes" : "No");
+		fprintf(f, "Current Stage: %d\n", quest->stageIndex);
+	}
+	else {
+		fprintf(f, "(none)\n");
+	}
+	fprintf(f, "\n");
+}
+
+static void DumpQuestList(FILE* f)
+{
+	fprintf(f, "=== PLAYER QUEST LIST ===\n");
+
+	DataHandler* dh = *g_dataHandler;
+	if (!dh) {
+		fprintf(f, "(DataHandler unavailable)\n\n");
+		return;
+	}
+
+	// Count quests
+	UInt32 activeCount = 0;
+	UInt32 completedCount = 0;
+	UInt32 totalCount = 0;
+
+	for (tList<TESQuest>::Iterator iter = dh->quests.Begin(); !iter.End(); ++iter) {
+		TESQuest* quest = iter.Get();
+		if (!quest) continue;
+		totalCount++;
+		if (quest->IsCompleted())
+			completedCount++;
+		else if ((quest->questFlags & TESQuest::kQuestFlag_Active) || quest->stageIndex > 0)
+			activeCount++;
+	}
+
+	fprintf(f, "Quest Summary:\n");
+	fprintf(f, "  Active:    %d\n", activeCount);
+	fprintf(f, "  Completed: %d\n", completedCount);
+	fprintf(f, "  Total:     %d\n\n", totalCount);
+
+	// Active quests
+	fprintf(f, "=== ACTIVE QUESTS (Started, Not Completed) ===\n");
+	UInt32 listedCount = 0;
+	for (tList<TESQuest>::Iterator iter = dh->quests.Begin(); !iter.End(); ++iter) {
+		TESQuest* quest = iter.Get();
+		if (!quest) continue;
+		if (quest->IsCompleted()) continue;
+		if (!(quest->questFlags & TESQuest::kQuestFlag_Active) && quest->stageIndex == 0) continue;
+
+		const char* questName = quest->fullName.name.m_data;
+		if (!questName || !questName[0]) questName = "(unnamed)";
+		const char* editorID = quest->editorName.m_data;
+		if (!editorID || !editorID[0]) editorID = "(none)";
+
+		fprintf(f, "  [%d] %s (0x%08X)\n", listedCount, questName, quest->refID);
+		fprintf(f, "      Editor ID: %s\n", editorID);
+		fprintf(f, "      Current Stage: %d\n", quest->stageIndex);
+		fprintf(f, "      Flags: 0x%02X (Active: %s)\n",
+			quest->questFlags,
+			(quest->questFlags & TESQuest::kQuestFlag_Active) ? "Yes" : "No");
+		listedCount++;
+	}
+	if (listedCount == 0)
+		fprintf(f, "  (No active quests)\n");
+
+	// Completed quests
+	fprintf(f, "\n=== COMPLETED QUESTS ===\n");
+	listedCount = 0;
+	for (tList<TESQuest>::Iterator iter = dh->quests.Begin(); !iter.End(); ++iter) {
+		TESQuest* quest = iter.Get();
+		if (!quest) continue;
+		if (!quest->IsCompleted()) continue;
+
+		const char* questName = quest->fullName.name.m_data;
+		if (!questName || !questName[0]) questName = "(unnamed)";
+		const char* editorID = quest->editorName.m_data;
+		if (!editorID || !editorID[0]) editorID = "(none)";
+
+		fprintf(f, "  [%d] %s (0x%08X)\n", listedCount, questName, quest->refID);
+		fprintf(f, "      Editor ID: %s\n", editorID);
+		fprintf(f, "      Final Stage: %d\n", quest->stageIndex);
+		listedCount++;
+	}
+	if (listedCount == 0)
+		fprintf(f, "  (No completed quests)\n");
+
+	fprintf(f, "\n");
+}
+
+static bool IsRefVariable(Script* script, UInt32 varId)
+{
+	if (!script || varId == 0) return false;
+	for (Script::RefListEntry* entry = &script->refList; entry; entry = entry->next) {
+		Script::RefVariable* ref = entry->var;
+		if (ref && ref->varIdx == varId)
+			return true;
+	}
+	return false;
+}
+
+static Script::VariableInfo* FindVarInfo(Script* script, UInt32 varId)
+{
+	if (!script) return NULL;
+	for (Script::VarInfoEntry* entry = &script->varList; entry; entry = entry->next) {
+		Script::VariableInfo* info = entry->data;
+		if (info && info->idx == varId)
+			return info;
+	}
+	return NULL;
+}
+
+static void DumpQuestScriptVars(FILE* f)
+{
+	fprintf(f, "=== QUEST SCRIPT VARIABLES ===\n");
+
+	DataHandler* dh = *g_dataHandler;
+	if (!dh) {
+		fprintf(f, "(DataHandler unavailable)\n\n");
+		return;
+	}
+
+	UInt32 questsWithScripts = 0;
+	UInt32 totalVarsDumped = 0;
+
+	for (tList<TESQuest>::Iterator iter = dh->quests.Begin(); !iter.End(); ++iter) {
+		TESQuest* quest = iter.Get();
+		if (!quest) continue;
+
+		Script* script = quest->scriptable.script;
+		const char* questName = quest->fullName.name.m_data;
+		if (!questName || !questName[0]) questName = "(unnamed)";
+		const char* editorID = quest->editorName.m_data;
+		if (!editorID || !editorID[0]) editorID = "(none)";
+
+		if (!script) continue;
+
+		ScriptEventList* eventList = quest->scriptEventList;
+		fprintf(f, "\n  Quest: %s (%s) [0x%08X]\n", questName, editorID, quest->refID);
+		questsWithScripts++;
+
+		if (!eventList || !eventList->m_vars) {
+			fprintf(f, "    (no runtime variables)\n");
+			continue;
+		}
+
+		UInt32 varCount = 0;
+		for (ScriptEventList::VarEntry* varEntry = eventList->m_vars; varEntry; varEntry = varEntry->next) {
+			ScriptEventList::Var* var = varEntry->var;
+			if (!var) continue;
+
+			UInt32 varId = var->id;
+			double value = var->data;
+
+			Script::VariableInfo* info = FindVarInfo(script, varId);
+			const char* varName = info ? info->name.m_data : NULL;
+			char nameBuf[64];
+			if (!varName || !varName[0]) {
+				sprintf_s(nameBuf, sizeof(nameBuf), "var_%d", varId);
+				varName = nameBuf;
+			}
+
+			bool isRef = IsRefVariable(script, varId);
+			if (isRef) {
+				UInt32 formID = (UInt32)(SInt64)value;
+				fprintf(f, "    %s = 0x%08X (ref)\n", varName, formID);
+			}
+			else if (info && info->type != 0) {
+				fprintf(f, "    %s = %d (int)\n", varName, (int)value);
+			}
+			else {
+				fprintf(f, "    %s = %f (float)\n", varName, value);
+			}
+			varCount++;
+			totalVarsDumped++;
+		}
+
+		if (varCount == 0)
+			fprintf(f, "    (no runtime variables)\n");
+	}
+
+	fprintf(f, "\n  Total quests with scripts: %d\n", questsWithScripts);
+	fprintf(f, "  Total script variables dumped: %d\n\n", totalVarsDumped);
+}
+
+static void DumpFactions(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== FACTIONS ===\n");
+
+	TESActorBaseData* baseData = OBLIVION_CAST(player->baseForm, TESForm, TESActorBaseData);
+	if (!baseData) {
+		fprintf(f, "(actor base data unavailable)\n\n");
+		return;
+	}
+
+	// Count factions
+	int totalFactions = 0;
+	for (TESActorBaseData::FactionListEntry* entry = &baseData->factionList; entry; entry = entry->next) {
+		TESActorBaseData::FactionListData* data = entry->data;
+		if (data && data->faction) totalFactions++;
+	}
+
+	fprintf(f, "Number of Factions: %d\n", totalFactions);
+
+	int idx = 0;
+	for (TESActorBaseData::FactionListEntry* entry = &baseData->factionList; entry; entry = entry->next) {
+		TESActorBaseData::FactionListData* data = entry->data;
+		if (!data || !data->faction) continue;
+
+		const char* factionName = data->faction->fullName.name.m_data;
+		if (!factionName || !factionName[0]) factionName = "(unnamed)";
+		fprintf(f, "  [%d] %s (0x%08X) - Rank: %d\n",
+			idx, factionName, data->faction->refID, data->rank);
+
+		// Try to get rank name
+		const char* rankName = data->faction->GetNthRankName(data->rank, false);
+		if (rankName && rankName[0])
+			fprintf(f, "       Rank Name: %s\n", rankName);
+
+		idx++;
+	}
+	if (totalFactions == 0)
+		fprintf(f, "  (none)\n");
+	fprintf(f, "\n");
+}
+
+static void DumpAttributes(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== ATTRIBUTES ===\n");
+	fprintf(f, "Format: Current (Base) [Max/Fortify | Script | Damage modifiers]\n\n");
+
+	static const UInt32 attrs[] = {
+		kActorVal_Strength, kActorVal_Intelligence, kActorVal_Willpower,
+		kActorVal_Agility, kActorVal_Speed, kActorVal_Endurance,
+		kActorVal_Personality, kActorVal_Luck
+	};
+	for (int i = 0; i < 8; i++) {
+		UInt32 av = attrs[i];
+		const char* name = GetActorValueString(av);
+		SInt32 current = player->GetActorValue(av);
+		UInt32 base = player->GetBaseActorValue(av);
+
+		float modMax = player->maxAVModifiers[av];
+		float modScript = player->scriptAVModifiers[av];
+		float modDamage = player->GetAVModifier(kAVModifier_Damage, av);
+
+		fprintf(f, "  %s: %d (Base: %d)", name ? name : "???", current, base);
+		if (modMax != 0.0f || modScript != 0.0f || modDamage != 0.0f)
+			fprintf(f, " [%.0f | %.0f | %.0f]", modMax, modScript, modDamage);
+		fprintf(f, "\n");
+	}
+	fprintf(f, "\n");
+}
+
+static void DumpDerivedStats(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== DERIVED STATS ===\n");
+	fprintf(f, "Format: Current / Max (Base) [Max/Fortify | Script | Damage modifiers]\n\n");
+
+	// Health, Magicka, Fatigue
+	struct DerivedStat { const char* name; UInt32 av; };
+	DerivedStat stats[] = {
+		{"Health",  kActorVal_Health},
+		{"Magicka", kActorVal_Magicka},
+		{"Fatigue", kActorVal_Fatigue},
+	};
+
+	for (int i = 0; i < 3; i++) {
+		UInt32 av = stats[i].av;
+		SInt32 current = player->GetActorValue(av);
+		UInt32 base = player->GetBaseActorValue(av);
+		float modMax = player->maxAVModifiers[av];
+		float modScript = player->scriptAVModifiers[av];
+		float modDamage = player->GetAVModifier(kAVModifier_Damage, av);
+		SInt32 maxVal = (SInt32)(base + modMax);
+
+		fprintf(f, "  %s: %d / %d (Base: %d)", stats[i].name, current, maxVal, base);
+		if (modMax != 0.0f || modScript != 0.0f || modDamage != 0.0f)
+			fprintf(f, " [%.0f | %.0f | %.0f]", modMax, modScript, modDamage);
+		fprintf(f, "\n");
+	}
+
+	// MagickaMultiplier
+	SInt32 magMult = player->GetActorValue(kActorVal_MagickaMultiplier);
+	if (magMult != 0 && magMult != 100)
+		fprintf(f, "    MagickaMultiplier: %d%%\n", magMult);
+
+	// Encumbrance
+	SInt32 encumbrance = player->GetActorValue(kActorVal_Encumbrance);
+	UInt32 baseEncumbrance = player->GetBaseActorValue(kActorVal_Encumbrance);
+	fprintf(f, "  Encumbrance: %d (Base: %d)\n", encumbrance, baseEncumbrance);
+
+	fprintf(f, "\n");
+}
+
+static void DumpSkills(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== SKILLS ===\n");
+	fprintf(f, "Format: Current (Base) [modifiers if non-zero]\n\n");
+
+	// Combat skills: Armorer(0x0C), Athletics(0x0D), Blade(0x0E), Block(0x0F), Blunt(0x10), HandToHand(0x11), HeavyArmor(0x12)
+	static const UInt32 combatSkills[] = {
+		kActorVal_Armorer, kActorVal_Athletics, kActorVal_Blade,
+		kActorVal_Block, kActorVal_Blunt, kActorVal_HandToHand, kActorVal_HeavyArmor
+	};
+	// Magic skills: Alchemy(0x13), Alteration(0x14), Conjuration(0x15), Destruction(0x16), Illusion(0x17), Mysticism(0x18), Restoration(0x19)
+	static const UInt32 magicSkills[] = {
+		kActorVal_Alchemy, kActorVal_Alteration, kActorVal_Conjuration,
+		kActorVal_Destruction, kActorVal_Illusion, kActorVal_Mysticism, kActorVal_Restoration
+	};
+	// Stealth skills: Acrobatics(0x1A), LightArmor(0x1B), Marksman(0x1C), Mercantile(0x1D), Security(0x1E), Sneak(0x1F), Speechcraft(0x20)
+	static const UInt32 stealthSkills[] = {
+		kActorVal_Acrobatics, kActorVal_LightArmor, kActorVal_Marksman,
+		kActorVal_Mercantile, kActorVal_Security, kActorVal_Sneak, kActorVal_Speechcraft
+	};
+
+	struct SkillGroup {
+		const char* name;
+		const UInt32* skills;
+		int count;
+	};
+	SkillGroup groups[] = {
+		{"Combat Skills:", combatSkills, 7},
+		{"Magic Skills:", magicSkills, 7},
+		{"Stealth Skills:", stealthSkills, 7},
+	};
+
+	int mastered = 0;
+	UInt32 highestVal = 0, lowestVal = 999;
+	const char* highestName = "?";
+	const char* lowestName = "?";
+	float totalSkill = 0;
+
+	for (int g = 0; g < 3; g++) {
+		fprintf(f, "%s\n", groups[g].name);
+		for (int i = 0; i < groups[g].count; i++) {
+			UInt32 av = groups[g].skills[i];
+			const char* name = GetActorValueString(av);
+			SInt32 current = player->GetActorValue(av);
+			UInt32 base = player->GetBaseActorValue(av);
+			float modMax = player->maxAVModifiers[av];
+			float modScript = player->scriptAVModifiers[av];
+			float modDamage = player->GetAVModifier(kAVModifier_Damage, av);
+
+			fprintf(f, "  %s: %d (Base: %d)", name ? name : "???", current, base);
+			if (modMax != 0.0f)
+				fprintf(f, " [Fortify: %.0f]", modMax);
+			fprintf(f, "\n");
+
+			// Stats tracking
+			if (base >= 100) mastered++;
+			if (base > highestVal) { highestVal = base; highestName = name ? name : "?"; }
+			if (base < lowestVal) { lowestVal = base; lowestName = name ? name : "?"; }
+			totalSkill += (float)base;
+		}
+	}
+
+	// Skill Highlights
+	fprintf(f, "\nSkill Highlights:\n");
+	if (mastered > 0)
+		fprintf(f, "  Mastered (100): %d skills\n", mastered);
+	fprintf(f, "  Highest: %s (%d), Lowest: %s (%d)\n", highestName, highestVal, lowestName, lowestVal);
+	fprintf(f, "  Average Skill Level: %.1f\n", totalSkill / 21.0f);
+	fprintf(f, "\n");
+}
+
+static void DumpMagicResist(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== MAGIC RESISTANCES & EFFECTS ===\n");
+
+	fprintf(f, "Resistances:\n");
+	fprintf(f, "  Resist Fire: %d%%\n", player->GetActorValue(kActorVal_ResistFire));
+	fprintf(f, "  Resist Frost: %d%%\n", player->GetActorValue(kActorVal_ResistFrost));
+	fprintf(f, "  Resist Shock: %d%%\n", player->GetActorValue(kActorVal_ResistShock));
+	fprintf(f, "  Resist Magic: %d%%\n", player->GetActorValue(kActorVal_ResistMagic));
+	fprintf(f, "  Resist Disease: %d%%\n", player->GetActorValue(kActorVal_ResistDisease));
+	fprintf(f, "  Resist Poison: %d%%\n", player->GetActorValue(kActorVal_ResistPoison));
+	fprintf(f, "  Resist Paralysis: %d%%\n", player->GetActorValue(kActorVal_ResistParalysis));
+	fprintf(f, "  Resist Normal Weapons: %d%%\n", player->GetActorValue(kActorVal_ResistNormalWeapons));
+
+	fprintf(f, "Magic Effects:\n");
+	fprintf(f, "  Spell Absorption: %d%%\n", player->GetActorValue(kActorVal_SpellAbsorbChance));
+	fprintf(f, "  Spell Reflect: %d%%\n", player->GetActorValue(kActorVal_SpellReflectChance));
+	fprintf(f, "  Reflect Damage: %d%%\n", player->GetActorValue(kActorVal_ReflectDamage));
+	fprintf(f, "  Chameleon: %d%%\n", player->GetActorValue(kActorVal_Chameleon));
+	fprintf(f, "  Invisibility: %d\n", player->GetActorValue(kActorVal_Invisibility));
+
+	SInt32 stuntedMagicka = player->GetActorValue(kActorVal_StuntedMagicka);
+	if (stuntedMagicka != 0)
+		fprintf(f, "  Stunted Magicka: %d (no natural regen)\n", stuntedMagicka);
+
+	fprintf(f, "\n");
+}
+
+static void DumpKnownSpells(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== SPELLS ===\n");
+
+	TESSpellList* spellList = OBLIVION_CAST(player->baseForm, TESForm, TESSpellList);
+	if (!spellList) {
+		fprintf(f, "(spell list unavailable)\n\n");
+		return;
+	}
+
+	// Count and categorize spells
+	int totalCount = 0;
+	int baseGameCount = 0;
+	int playerCreatedCount = 0;
+	int countSpell = 0, countPower = 0, countLesserPower = 0, countAbility = 0, countDisease = 0;
+
+	for (TESSpellList::Entry* entry = &spellList->spellList; entry; entry = entry->next) {
+		TESForm* spellForm = entry->type;
+		if (!spellForm) continue;
+		totalCount++;
+
+		bool isPlayerCreated = ((spellForm->refID >> 24) == 0xFF);
+		if (isPlayerCreated) playerCreatedCount++;
+		else baseGameCount++;
+
+		SpellItem* spell = OBLIVION_CAST(spellForm, TESForm, SpellItem);
+		if (spell) {
+			switch (spell->spellType) {
+			case SpellItem::kType_Spell:       countSpell++; break;
+			case SpellItem::kType_Power:       countPower++; break;
+			case SpellItem::kType_LesserPower: countLesserPower++; break;
+			case SpellItem::kType_Ability:     countAbility++; break;
+			case SpellItem::kType_Disease:     countDisease++; break;
+			}
+		}
+	}
+
+	fprintf(f, "Number of Spells: %d\n", totalCount);
+	fprintf(f, "Base Game Spells: %d\n", baseGameCount);
+	fprintf(f, "Player-Created Spells: %d\n\n", playerCreatedCount);
+	fprintf(f, "By Type: %d Spell, %d Power, %d LesserPower, %d Ability",
+		countSpell, countPower, countLesserPower, countAbility);
+	if (countDisease > 0) fprintf(f, ", %d Disease", countDisease);
+	fprintf(f, "\n\n");
+
+	// --- Base Game Spells ---
+	fprintf(f, "--- Base Game Spells ---\n");
+	int idx = 0;
+	for (TESSpellList::Entry* entry = &spellList->spellList; entry; entry = entry->next) {
+		TESForm* spellForm = entry->type;
+		if (!spellForm) continue;
+		if ((spellForm->refID >> 24) == 0xFF) continue;  // skip player-created
+
+		const char* name = GetFullName(spellForm);
+		SpellItem* spell = OBLIVION_CAST(spellForm, TESForm, SpellItem);
+
+		if (spell) {
+			UInt32 cost = spell->GetMagickaCost();
+			if (cost == 0xFFFFFFFF)
+				fprintf(f, "  [%d] %s (0x%08X) Type: %s, Cost: Auto\n",
+					idx, name ? name : "(null)", spellForm->refID,
+					GetSpellTypeName(spell->spellType));
+			else
+				fprintf(f, "  [%d] %s (0x%08X) Type: %s, Cost: %u\n",
+					idx, name ? name : "(null)", spellForm->refID,
+					GetSpellTypeName(spell->spellType), cost);
+			// Effect lines
+			DumpSpellEffects(f, spell, "       ");
+		}
+		else {
+			fprintf(f, "  [%d] %s (0x%08X)\n", idx, name ? name : "(null)", spellForm->refID);
+		}
+		idx++;
+	}
+
+	// --- Player-Created Spells ---
+	if (playerCreatedCount > 0) {
+		fprintf(f, "\n--- Player-Created Spells (Mod Index 0xFF) ---\n");
+		idx = 0;
+		for (TESSpellList::Entry* entry = &spellList->spellList; entry; entry = entry->next) {
+			TESForm* spellForm = entry->type;
+			if (!spellForm) continue;
+			if ((spellForm->refID >> 24) != 0xFF) continue;
+
+			const char* name = GetFullName(spellForm);
+			SpellItem* spell = OBLIVION_CAST(spellForm, TESForm, SpellItem);
+
+			fprintf(f, "  [%d] %s (0x%08X)\n", idx, name ? name : "(null)", spellForm->refID);
+			if (spell) {
+				fprintf(f, "       Type: %s, Cost: %u, Mastery: %s\n",
+					GetSpellTypeName(spell->spellType), spell->magickaCost,
+					GetMasteryName(spell->masteryLevel));
+				fprintf(f, "       Flags: 0x%02X", spell->spellFlags);
+				if (spell->spellFlags & SpellItem::kFlag_NoAutoCalc) fprintf(f, " NoAutoCalc");
+				fprintf(f, "\n");
+
+				// Full effect details
+				EffectItemList* effList = &spell->magicItem.list;
+				UInt32 effCount = effList->CountItems();
+				fprintf(f, "       Effects: %u\n", effCount);
+				for (UInt32 ei = 0; ei < effCount; ei++) {
+					EffectItem* eff = effList->ItemAt(ei);
+					if (!eff) continue;
+
+					char codeStr[5];
+					EffectCodeToStr(eff->effectCode, codeStr);
+
+					const char* effName = "(unknown)";
+					if (eff->setting && eff->setting->fullName.name.m_data)
+						effName = eff->setting->fullName.name.m_data;
+
+					fprintf(f, "         [%u] %s - Mag: %u, Dur: %u, Area: %u, Range: %s, Cost: %.2f\n",
+						ei, effName, eff->magnitude, eff->duration, eff->area,
+						GetRangeName(eff->range), eff->cost);
+					fprintf(f, "               EffectCode: '%s' (0x%08X), ActorValue: %u\n",
+						codeStr, eff->effectCode, eff->actorValueOrOther);
+				}
+			}
+			idx++;
+		}
+	}
+
+	fprintf(f, "\n");
+}
+
+static void DumpInventory(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== INVENTORY ===\n");
+
+	ExtraContainerChanges* changes = ExtraContainerChanges::GetForRef(player);
+	if (!changes || !changes->data || !changes->data->objList) {
+		fprintf(f, "(empty or unavailable)\n\n");
+		return;
+	}
+
+	// Weight/capacity header
+	float totalWeight = changes->data->totalWeight;
+	float armorWeight = changes->data->armorWeight;
+	SInt32 encumbrance = player->GetActorValue(kActorVal_Encumbrance);
+	UInt32 baseEncumbrance = player->GetBaseActorValue(kActorVal_Encumbrance);
+	fprintf(f, "Total Weight: %.2f\n", totalWeight);
+	fprintf(f, "Armor Weight: %.2f\n", armorWeight);
+	fprintf(f, "Carry Capacity: %.2f / %d\n", totalWeight, baseEncumbrance);
+
+	// Count items by type
+	int totalItems = 0;
+	int weaponCount = 0, armorCount = 0, clothingCount = 0, potionCount = 0;
+	int ingredientCount = 0, bookCount = 0, miscCount = 0, otherCount = 0;
+	int playerPotionCount = 0;
+	UInt32 goldAmount = 0;
+
+	for (tList<ExtraContainerChanges::EntryData>::Iterator iter = changes->data->objList->Begin();
+		!iter.End(); ++iter)
+	{
+		ExtraContainerChanges::EntryData* entry = iter.Get();
+		if (!entry || !entry->type) continue;
+		totalItems++;
+		switch (entry->type->typeID) {
+		case kFormType_Weapon:      weaponCount++; break;
+		case kFormType_Armor:       armorCount++; break;
+		case kFormType_Clothing:    clothingCount++; break;
+		case kFormType_AlchemyItem:
+			potionCount++;
+			if ((entry->type->refID >> 24) == 0xFF) playerPotionCount++;
+			break;
+		case kFormType_Ingredient:  ingredientCount++; break;
+		case kFormType_Book:        bookCount++; break;
+		case kFormType_Misc:
+			// Check if it's gold
+			if (entry->type->refID == 0x0000000F)
+				goldAmount = entry->countDelta > 0 ? entry->countDelta : 0;
+			else
+				miscCount++;
+			break;
+		default: otherCount++; break;
+		}
+	}
+
+	fprintf(f, "Unique Stacks: %d, Gold: %d\n", totalItems, goldAmount);
+	fprintf(f, "Breakdown: %d weapons, %d armor, %d clothing, %d potions, %d ingredients, %d books, %d misc, %d other\n\n",
+		weaponCount, armorCount, clothingCount, potionCount, ingredientCount, bookCount, miscCount, otherCount);
+
+	// Items with full details
+	fprintf(f, "Items:\n");
+	int itemIdx = 0;
+	for (tList<ExtraContainerChanges::EntryData>::Iterator iter = changes->data->objList->Begin();
+		!iter.End(); ++iter)
+	{
+		ExtraContainerChanges::EntryData* entry = iter.Get();
+		if (!entry || !entry->type) continue;
+
+		const char* name = GetFullName(entry->type);
+		const char* category = GetItemCategoryName(entry->type->typeID);
+		bool isPlayerCreated = ((entry->type->refID >> 24) == 0xFF);
+
+		// Check extra data for equipped status, condition, etc.
+		bool isWorn = false;
+		float itemHealth = -1.0f;
+		float itemCharge = -1.0f;
+		UInt8 itemSoul = 0xFF;
+		UInt32 poisonID = 0;
+
+		if (entry->extendData) {
+			for (tList<ExtraDataList>::Iterator edlIter = entry->extendData->Begin();
+				!edlIter.End(); ++edlIter)
+			{
+				ExtraDataList* edl = edlIter.Get();
+				if (!edl) continue;
+
+				BSExtraData* extra = edl->m_data;
+				while (extra) {
+					switch (extra->type) {
+					case kExtraData_Health:
+						itemHealth = ((ExtraHealth*)extra)->health;
+						break;
+					case kExtraData_Charge:
+						itemCharge = ((ExtraCharge*)extra)->charge;
+						break;
+					case kExtraData_Soul:
+						itemSoul = ((ExtraSoul*)extra)->soul;
+						break;
+					case kExtraData_Poison:
+						if (((ExtraPoison*)extra)->poison)
+							poisonID = ((ExtraPoison*)extra)->poison->refID;
+						break;
+					case kExtraData_Worn:
+					case kExtraData_WornLeft:
+						isWorn = true;
+						break;
+					}
+					extra = extra->next;
+				}
+			}
+		}
+
+		fprintf(f, "  [%d] %s x%d (0x%08X) [%s]",
+			itemIdx, name ? name : "(null)", entry->countDelta, entry->type->refID, category);
+		if (isWorn) fprintf(f, " [EQUIPPED]");
+		fprintf(f, "\n");
+
+		// Type-specific detail lines
+		TESObjectWEAP* weapon = OBLIVION_CAST(entry->type, TESForm, TESObjectWEAP);
+		TESObjectARMO* armor = OBLIVION_CAST(entry->type, TESForm, TESObjectARMO);
+		AlchemyItem* potion = OBLIVION_CAST(entry->type, TESForm, AlchemyItem);
+
+		if (weapon) {
+			fprintf(f, "       Type: %s, Damage: %u, Speed: %.2f, Reach: %.2f\n",
+				GetWeaponTypeName(weapon->type), weapon->attackDmg.damage,
+				weapon->speed, weapon->reach);
+			fprintf(f, "       Weight: %.1f, Value: %u\n",
+				weapon->weight.weight, weapon->value.value);
+			if (itemHealth >= 0.0f)
+				fprintf(f, "       Condition: %.0f / %u (%.0f%%)\n",
+					itemHealth, weapon->health.health,
+					weapon->health.health > 0 ? (itemHealth / weapon->health.health * 100.0f) : 0.0f);
+			if (itemCharge >= 0.0f)
+				fprintf(f, "       Charge: %.0f\n", itemCharge);
+			// Enchantment effects
+			if (weapon->enchantable.enchantItem) {
+				fprintf(f, "       Enchantment:\n");
+				DumpEnchantmentEffects(f, weapon->enchantable.enchantItem, "         ");
+			}
+		}
+		else if (armor) {
+			fprintf(f, "       Type: %s, Rating: %u\n",
+				armor->IsHeavyArmor() ? "Heavy" : "Light",
+				(UInt32)armor->armorRating);
+			fprintf(f, "       Weight: %.1f, Value: %u\n",
+				armor->weight.weight, armor->value.value);
+			if (itemHealth >= 0.0f)
+				fprintf(f, "       Condition: %.0f / %u (%.0f%%)\n",
+					itemHealth, armor->health.health,
+					armor->health.health > 0 ? (itemHealth / armor->health.health * 100.0f) : 0.0f);
+			// Enchantment effects
+			if (armor->enchantable.enchantItem) {
+				fprintf(f, "       Enchantment:\n");
+				DumpEnchantmentEffects(f, armor->enchantable.enchantItem, "         ");
+			}
+		}
+		else if (potion && !isPlayerCreated) {
+			// Show effects for potions
+			EffectItemList* effList = &potion->magicItem.list;
+			UInt32 effCount = effList->CountItems();
+			for (UInt32 ei = 0; ei < effCount; ei++) {
+				EffectItem* eff = effList->ItemAt(ei);
+				if (!eff) continue;
+				char codeStr[5];
+				EffectCodeToStr(eff->effectCode, codeStr);
+				const char* effName = "(unknown)";
+				if (eff->setting && eff->setting->fullName.name.m_data)
+					effName = eff->setting->fullName.name.m_data;
+				fprintf(f, "       Effect %u: %s [%s] (%s) Mag: %u Dur: %us",
+					ei, effName, codeStr, GetRangeName(eff->range),
+					eff->magnitude, eff->duration);
+				if (eff->HasActorValue()) {
+					const char* avName = GetActorValueString(eff->GetActorValue());
+					if (avName) fprintf(f, " [%s]", avName);
+				}
+				fprintf(f, "\n");
+			}
+		}
+
+		// Soul gem
+		if (itemSoul != 0xFF && itemSoul > 0)
+			fprintf(f, "       Soul: %s\n", GetSoulName(itemSoul));
+		if (poisonID)
+			fprintf(f, "       Poison: 0x%08X\n", poisonID);
+
+		itemIdx++;
+	}
+
+	fprintf(f, "\nTotal unique item types: %d\n", totalItems);
+
+	// --- Player-Created Potions/Poisons ---
+	if (playerPotionCount > 0) {
+		fprintf(f, "\n--- Player-Created Potions/Poisons (Mod Index 0xFF) ---\n");
+		int potIdx = 0;
+		for (tList<ExtraContainerChanges::EntryData>::Iterator iter = changes->data->objList->Begin();
+			!iter.End(); ++iter)
+		{
+			ExtraContainerChanges::EntryData* entry = iter.Get();
+			if (!entry || !entry->type) continue;
+			if (entry->type->typeID != kFormType_AlchemyItem) continue;
+			if ((entry->type->refID >> 24) != 0xFF) continue;
+
+			const char* name = GetFullName(entry->type);
+			AlchemyItem* potion = OBLIVION_CAST(entry->type, TESForm, AlchemyItem);
+
+			fprintf(f, "  [%d] %s x%d (0x%08X)\n", potIdx, name ? name : "(null)", entry->countDelta, entry->type->refID);
+
+			if (potion) {
+				fprintf(f, "       Weight: %.1f, Value: %u\n",
+					potion->weight.weight, potion->goldValue);
+				fprintf(f, "       Flags: 0x%02X", potion->moreFlags);
+				if (potion->moreFlags & AlchemyItem::kAlchemy_NoAutocalc) fprintf(f, " NoAutoCalc");
+				if (potion->moreFlags & AlchemyItem::kAlchemy_IsFood) fprintf(f, " IsFood");
+				fprintf(f, "\n");
+
+				EffectItemList* effList = &potion->magicItem.list;
+				UInt32 effCount = effList->CountItems();
+				fprintf(f, "       Effects: %u\n", effCount);
+				for (UInt32 ei = 0; ei < effCount; ei++) {
+					EffectItem* eff = effList->ItemAt(ei);
+					if (!eff) continue;
+
+					char codeStr[5];
+					EffectCodeToStr(eff->effectCode, codeStr);
+
+					const char* effName = "(unknown)";
+					if (eff->setting && eff->setting->fullName.name.m_data)
+						effName = eff->setting->fullName.name.m_data;
+
+					fprintf(f, "         [%u] %s - Mag: %u, Dur: %u, Area: %u, Range: %s, Cost: %.2f\n",
+						ei, effName, eff->magnitude, eff->duration, eff->area,
+						GetRangeName(eff->range), eff->cost);
+					fprintf(f, "               EffectCode: '%s' (0x%08X), ActorValue: %u\n",
+						codeStr, eff->effectCode, eff->actorValueOrOther);
+				}
+			}
+			potIdx++;
+		}
+		fprintf(f, "Total Player-Created Potions: %d\n", playerPotionCount);
+	}
+
+	fprintf(f, "\n");
+}
+
+static void DumpActiveEffects(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== ACTIVE MAGIC EFFECTS ===\n");
+
+	MagicTarget* target = player->GetMagicTarget();
+	if (!target) {
+		fprintf(f, "(magic target unavailable)\n\n");
+		return;
+	}
+
+	MagicTarget::EffectNode* effectList = target->GetEffectList();
+	if (!effectList) {
+		fprintf(f, "(no active effects)\n\n");
+		return;
+	}
+
+	int count = 0;
+	for (MagicTarget::EffectNode* node = effectList; node; node = node->next) {
+		ActiveEffect* ae = node->data;
+		if (!ae) continue;
+
+		const char* effectName = "(unknown)";
+		if (ae->effectItem && ae->effectItem->setting) {
+			TESFullName* fn = &ae->effectItem->setting->fullName;
+			if (fn && fn->name.m_data && fn->name.m_dataLen > 0)
+				effectName = fn->name.m_data;
+		}
+
+		// Effect code
+		char codeStr[5] = {0};
+		if (ae->effectItem)
+			EffectCodeToStr(ae->effectItem->effectCode, codeStr);
+
+		fprintf(f, "  [%d] %s [%s]  Mag=%.1f  Dur=%.1f  Elapsed=%.1f\n",
+			count, effectName, codeStr, ae->magnitude, ae->duration, ae->timeElapsed);
+
+		const char* sourceName = "(unknown source)";
+		if (ae->item) {
+			if (ae->item->name.m_data && ae->item->name.m_dataLen > 0)
+				sourceName = ae->item->name.m_data;
+		}
+		fprintf(f, "       Source: %s  (type: %d)\n", sourceName, ae->spellType);
+
+		count++;
+	}
+	if (count == 0)
+		fprintf(f, "  (none)\n");
+	fprintf(f, "\nTotal active effects: %d\n\n", count);
+}
+
+static void DumpStatusEffects(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== STATUS EFFECTS & ADDITIONAL ACTOR VALUES ===\n");
+
+	struct AVEntry { const char* name; UInt32 av; };
+
+	// AI Personality
+	fprintf(f, "AI Personality:\n");
+	{
+		AVEntry aiVals[] = {
+			{"Aggression",     kActorVal_Aggression},
+			{"Confidence",     kActorVal_Confidence},
+			{"Energy",         kActorVal_Energy},
+			{"Responsibility", kActorVal_Responsibility},
+		};
+		for (int i = 0; i < 4; i++) {
+			SInt32 cur = player->GetActorValue(aiVals[i].av);
+			UInt32 base = player->GetBaseActorValue(aiVals[i].av);
+			fprintf(f, "  %s: %d (Base: %d)\n", aiVals[i].name, cur, base);
+		}
+	}
+
+	// Magic bonuses
+	fprintf(f, "Magic Bonuses:\n");
+	{
+		AVEntry magicVals[] = {
+			{"NightEyeBonus",  kActorVal_NightEyeBonus},
+			{"AttackBonus",    kActorVal_AttackBonus},
+			{"DefendBonus",    kActorVal_DefendBonus},
+			{"CastingPenalty", kActorVal_CastingPenalty},
+			{"Blindness",      kActorVal_Blindness},
+		};
+		for (int i = 0; i < 5; i++) {
+			SInt32 cur = player->GetActorValue(magicVals[i].av);
+			UInt32 base = player->GetBaseActorValue(magicVals[i].av);
+			fprintf(f, "  %s: %d (Base: %d)\n", magicVals[i].name, cur, base);
+		}
+	}
+
+	// Status effects
+	fprintf(f, "Status Effects:\n");
+	{
+		AVEntry statusVals[] = {
+			{"Paralysis",           kActorVal_Paralysis},
+			{"Silence",             kActorVal_Silence},
+			{"Confusion",           kActorVal_Confusion},
+			{"DetectItemRange",     kActorVal_DetectItemRange},
+			{"SwimSpeedMultiplier", kActorVal_SwimSpeedMultiplier},
+			{"WaterBreathing",      kActorVal_WaterBreathing},
+			{"WaterWalking",        kActorVal_WaterWalking},
+			{"DetectLifeRange",     kActorVal_DetectLifeRange},
+			{"Telekinesis",         kActorVal_Telekinesis},
+		};
+		for (int i = 0; i < 9; i++) {
+			SInt32 cur = player->GetActorValue(statusVals[i].av);
+			UInt32 base = player->GetBaseActorValue(statusVals[i].av);
+			fprintf(f, "  %s: %d (Base: %d)\n", statusVals[i].name, cur, base);
+		}
+	}
+
+	// Other
+	fprintf(f, "Other:\n");
+	{
+		AVEntry otherVals[] = {
+			{"Vampirism",         kActorVal_Vampirism},
+			{"Darkness",          kActorVal_Darkness},
+			{"ResistWaterDamage", kActorVal_ResistWaterDamage},
+		};
+		for (int i = 0; i < 3; i++) {
+			SInt32 cur = player->GetActorValue(otherVals[i].av);
+			UInt32 base = player->GetBaseActorValue(otherVals[i].av);
+			fprintf(f, "  %s: %d (Base: %d)\n", otherVals[i].name, cur, base);
+		}
+	}
+
+	fprintf(f, "\n");
+}
+
+static void DumpSkillProgress(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== SKILL EXPERIENCE PROGRESS ===\n");
+
+	fprintf(f, "Major Skill Advances: %d\n", player->majorSkillAdvances);
+	fprintf(f, "Can Level Up: %s\n", player->bCanLevelUp ? "Yes" : "No");
+
+	if (player->bCanLevelUp)
+		fprintf(f, ">>> READY TO LEVEL UP! Sleep in a bed to level up. <<<\n");
+	else if (player->majorSkillAdvances > 0) {
+		int thisLevel = player->majorSkillAdvances % 10;
+		if (thisLevel == 0 && player->majorSkillAdvances > 0)
+			thisLevel = 10;
+		int remaining = 10 - thisLevel;
+		if (remaining > 0 && remaining < 10)
+			fprintf(f, "Level-up progress: %d/10 major skill advances (%d more needed)\n", thisLevel, remaining);
+		else
+			fprintf(f, "Level-up progress: %d/10 major skill advances\n", thisLevel);
+	}
+	else {
+		fprintf(f, "Level-up progress: 0/10 major skill advances (10 more needed)\n");
+	}
+
+	fprintf(f, "\nPer-Skill XP Progress (Current / Needed):\n");
+	for (UInt32 av = kActorVal_Armorer; av <= kActorVal_Speechcraft; av++) {
+		const char* name = GetActorValueString(av);
+		UInt32 idx = av - kActorVal_Armorer;
+		float xp = player->skillExp[idx];
+		float needed = player->requiredSkillExp[idx];
+		UInt32 advances = player->skillAdv[idx];
+
+		fprintf(f, "  %-15s: %.2f", name ? name : "???", xp);
+		if (needed > 0.0f)
+			fprintf(f, " / %.2f (%.0f%%)", needed, (xp / needed) * 100.0f);
+		else if (needed == 0.0f)
+			fprintf(f, " / 0 (maxed)");
+		if (advances > 0)
+			fprintf(f, " [advanced %d times]", advances);
+		fprintf(f, "\n");
+	}
+	fprintf(f, "\n");
+}
+
+static void DumpAVModifiers(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== ACTOR VALUE MODIFIERS ===\n");
+	fprintf(f, "Format: AV Name: [Fortify/Max | Script | Damage]\n\n");
+
+	UInt32 nonZeroCount = 0;
+	for (UInt32 av = 0; av < kActorVal_OblivionMax; av++) {
+		float modMax = player->maxAVModifiers[av];
+		float modScript = player->scriptAVModifiers[av];
+		float modDamage = player->GetAVModifier(kAVModifier_Damage, av);
+
+		if (modMax != 0.0f || modScript != 0.0f || modDamage != 0.0f) {
+			const char* name = GetActorValueString(av);
+			fprintf(f, "  %-24s [%+8.1f | %+8.1f | %+8.1f]\n",
+				name ? name : "???", modMax, modScript, modDamage);
+			nonZeroCount++;
+		}
+	}
+	if (nonZeroCount == 0)
+		fprintf(f, "  (all modifiers are zero)\n");
+	else
+		fprintf(f, "  Total non-zero: %d / %d\n", nonZeroCount, kActorVal_OblivionMax);
+
+	fprintf(f, "\n");
+}
+
+static void DumpQuickKeys(FILE* f)
+{
+	fprintf(f, "=== QUICK KEYS ===\n");
+
+	if (!g_quickKeyList) {
+		fprintf(f, "(quick key array not accessible)\n\n");
+		return;
+	}
+
+	UInt32 totalAssigned = 0;
+	for (int slot = 0; slot < 8; slot++) {
+		NiTPointerList<TESForm>* quickKey = &g_quickKeyList[slot];
+		fprintf(f, "  Slot %d: ", slot + 1);
+
+		if (!quickKey->numItems || !quickKey->start) {
+			fprintf(f, "(empty)\n");
+			continue;
+		}
+
+		NiTListBase<TESForm>::Node* node = quickKey->start;
+		if (node && node->data) {
+			TESForm* form = node->data;
+			const char* name = GetFullName(form);
+			const char* category = GetItemCategoryName(form->typeID);
+			fprintf(f, "%s (0x%08X) [%s]\n",
+				name ? name : "(unknown)", form->refID, category);
+			totalAssigned++;
+		}
+		else {
+			fprintf(f, "(empty)\n");
+		}
+	}
+	fprintf(f, "\n  Total assigned: %d / 8 slots\n\n", totalAssigned);
+}
+
+static void DumpCellItems(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== CELL ITEMS & CONTAINERS ===\n");
+
+	TESObjectCELL* cell = player->parentCell;
+	if (!cell) {
+		fprintf(f, "(Player has no parent cell)\n\n");
+		return;
+	}
+
+	const char* cellName = cell->fullName.name.m_data;
+	if (!cellName || cell->fullName.name.m_dataLen == 0) cellName = "(unnamed)";
+	fprintf(f, "Cell: %s (0x%08X)\n\n", cellName, cell->refID);
+
+	UInt32 refCount = 0;
+	UInt32 looseItemCount = 0;
+	UInt32 containerCount = 0;
+
+	for (TESObjectCELL::ObjectListEntry* entry = &cell->objectList; entry; entry = entry->next) {
+		TESObjectREFR* ref = entry->refr;
+		if (!ref) continue;
+		if (refCount >= 5000) break;
+		refCount++;
+
+		TESForm* base = ref->baseForm;
+		if (!base) continue;
+
+		UInt8 formType = base->typeID;
+
+		// Loose items on the ground
+		const char* itemTypeName = NULL;
+		switch (formType) {
+		case kFormType_Weapon:      itemTypeName = "Weapon"; break;
+		case kFormType_Armor:       itemTypeName = "Armor"; break;
+		case kFormType_Clothing:    itemTypeName = "Clothing"; break;
+		case kFormType_Book:        itemTypeName = "Book"; break;
+		case kFormType_Ingredient:  itemTypeName = "Ingredient"; break;
+		case kFormType_Light:       itemTypeName = "Light"; break;
+		case kFormType_Misc:        itemTypeName = "Misc"; break;
+		case kFormType_Key:         itemTypeName = "Key"; break;
+		case kFormType_Ammo:        itemTypeName = "Ammo"; break;
+		case kFormType_SoulGem:     itemTypeName = "SoulGem"; break;
+		case kFormType_AlchemyItem: itemTypeName = "Potion"; break;
+		case kFormType_Apparatus:   itemTypeName = "Apparatus"; break;
+		case kFormType_SigilStone:  itemTypeName = "SigilStone"; break;
+		}
+
+		if (itemTypeName) {
+			const char* name = GetFullName(base);
+			if (name)
+				fprintf(f, "  [Loose] %s (ref 0x%08X, base 0x%08X) [%s]\n",
+					name, ref->refID, base->refID, itemTypeName);
+			else
+				fprintf(f, "  [Loose] (ref 0x%08X, base 0x%08X) [%s]\n",
+					ref->refID, base->refID, itemTypeName);
+			fprintf(f, "    Pos: %f %f %f\n", ref->posX, ref->posY, ref->posZ);
+			fprintf(f, "    Rot: %f %f %f\n", ref->rotX, ref->rotY, ref->rotZ);
+			fprintf(f, "    Scale: %.2f\n", ref->scale);
+			looseItemCount++;
+			continue;
+		}
+
+		// Containers, NPCs, Creatures
+		bool isContainer = (formType == kFormType_Container);
+		bool isNPC = (formType == kFormType_NPC);
+		bool isCreature = (formType == kFormType_Creature);
+
+		if (isContainer || isNPC || isCreature) {
+			const char* contLabel = isContainer ? "Container" : (isNPC ? "NPC" : "Creature");
+			const char* contName = GetFullName(base);
+			fprintf(f, "  [%s] %s (ref 0x%08X, base 0x%08X) at (%.1f, %.1f, %.1f)\n",
+				contLabel,
+				contName ? contName : "(unknown)",
+				ref->refID, base->refID,
+				ref->posX, ref->posY, ref->posZ);
+
+			containerCount++;
+
+			// Base container items
+			TESContainer* container = OBLIVION_CAST(base, TESForm, TESContainer);
+			if (container) {
+				UInt32 baseItemCount = 0;
+				for (TESContainer::Entry* cEntry = &container->list; cEntry && baseItemCount < 500; cEntry = cEntry->next) {
+					TESContainer::Data* data = cEntry->data;
+					if (data && data->type && data->count > 0) {
+						const char* eName = GetFullName(data->type);
+						fprintf(f, "    - %s x%d (0x%08X) [base]\n",
+							eName ? eName : "(unknown)", data->count, data->type->refID);
+						baseItemCount++;
+					}
+				}
+			}
+
+			// Runtime container changes
+			ExtraContainerChanges* cellChanges = (ExtraContainerChanges*)ref->baseExtraList.GetByType(kExtraData_ContainerChanges);
+			if (cellChanges && cellChanges->data && cellChanges->data->objList) {
+				UInt32 extraCount = 0;
+				for (tList<ExtraContainerChanges::EntryData>::Iterator eIter = cellChanges->data->objList->Begin();
+					!eIter.End() && extraCount < 500; ++eIter)
+				{
+					ExtraContainerChanges::EntryData* eData = eIter.Get();
+					if (eData && eData->type && eData->countDelta != 0) {
+						const char* eName = GetFullName(eData->type);
+						fprintf(f, "    - %s x%d (0x%08X) [delta]\n",
+							eName ? eName : "(unknown)", eData->countDelta, eData->type->refID);
+						extraCount++;
+					}
+				}
+			}
+		}
+	}
+
+	fprintf(f, "\n--- Cell Summary: %d refs scanned, %d loose items, %d containers/NPCs ---\n\n",
+		refCount, looseItemCount, containerCount);
+}
+
+static void DumpPluginList(FILE* f)
+{
+	fprintf(f, "=== PLUGIN LIST ===\n");
+
+	DataHandler* dh = *g_dataHandler;
+	if (!dh) {
+		fprintf(f, "(DataHandler unavailable)\n\n");
+		return;
+	}
+
+	fprintf(f, "Plugin Count: %d\n\n", dh->numLoadedMods);
+	fprintf(f, "Loaded Plugins:\n");
+	for (UInt32 i = 0; i < dh->numLoadedMods; i++) {
+		const char* modName = dh->GetNthModName(i);
+		fprintf(f, "  [%2u] %s\n", i, modName ? modName : "(null)");
+	}
+	fprintf(f, "\n");
+}
+
+// ============================================================================
+// Appearance Dump — Hair, Eyes, Hair Color, FaceGen Morphs
+// ============================================================================
+
+static void DumpAppearance(FILE* f, PlayerCharacter* player)
+{
+	fprintf(f, "=== APPEARANCE ===\n");
+
+	TESNPC* npc = OBLIVION_CAST(player->baseForm, TESForm, TESNPC);
+	if (!npc) {
+		fprintf(f, "(Player base form is not TESNPC)\n\n");
+		return;
+	}
+
+	// --- Hair ---
+	if (npc->hair) {
+		const char* hairName = npc->hair->fullName.name.m_data;
+		fprintf(f, "Hair: %s (0x%08X)\n", hairName ? hairName : "(unknown)", npc->hair->refID);
+	} else {
+		fprintf(f, "Hair: (none)\n");
+	}
+
+	// --- Eyes ---
+	if (npc->eyes) {
+		const char* eyesName = npc->eyes->fullName.name.m_data;
+		fprintf(f, "Eyes: %s (0x%08X)\n", eyesName ? eyesName : "(unknown)", npc->eyes->refID);
+	} else {
+		fprintf(f, "Eyes: (none)\n");
+	}
+
+	// --- Hair Color (RGB bytes, 0-255) ---
+	fprintf(f, "HairColor: %u %u %u\n", npc->hairColorRGB[0], npc->hairColorRGB[1], npc->hairColorRGB[2]);
+
+	// --- Hair Length (stored as float at 0x1CC, despite UInt32 declaration) ---
+	float hairLen = *(float*)&npc->hairLength;
+	fprintf(f, "HairLength: %.6f\n", hairLen);
+
+	// --- FaceGen Morph Data ---
+	// Discovered via memory diagnostic: unk1[4] and unk2[4] are FaceGen arrays.
+	// Each Unk struct (0x18 bytes): {u32 capacity, u32 flag, u32 unk, u32* data, u32* end, u32* allocEnd}
+	// unk1[0..2] at 0x108 = FGGS(50), FGGA(30), FGTS(50)
+	// unk2[0..2] at 0x168 = FGGS2(50), FGGA2(30), FGTS2(50)
+	// Data pointer is at struct_base + 0x0C, end pointer at struct_base + 0x10
+	UInt8* npcBytes = (UInt8*)npc;
+	struct FGArrayDef { UInt32 baseOff; const char* label; };
+	FGArrayDef fgArrays[] = {
+		{0x108, "FaceGenGeometry"},    // unk1[0]: FGGS, 50 floats
+		{0x120, "FaceGenAsymmetry"},   // unk1[1]: FGGA, 30 floats
+		{0x138, "FaceGenTexture"},     // unk1[2]: FGTS, 50 floats
+		{0x168, "FaceGenGeometry2"},   // unk2[0]: FGGS2, 50 floats
+		{0x180, "FaceGenAsymmetry2"},  // unk2[1]: FGGA2, 30 floats
+		{0x198, "FaceGenTexture2"},    // unk2[2]: FGTS2, 50 floats
+	};
+	for (int ai = 0; ai < 6; ai++)
+	{
+		__try
+		{
+			UInt32 dataPtrOff = fgArrays[ai].baseOff + 0x0C;
+			UInt32 endPtrOff  = fgArrays[ai].baseOff + 0x10;
+			UInt32 dataPtr = *(UInt32*)(npcBytes + dataPtrOff);
+			UInt32 endPtr  = *(UInt32*)(npcBytes + endPtrOff);
+
+			if (dataPtr && endPtr > dataPtr && !IsBadReadPtr((void*)dataPtr, 4))
+			{
+				UInt32 numFloats = (endPtr - dataPtr) / 4;
+				if (numFloats > 200) numFloats = 200;
+				float* fdata = (float*)dataPtr;
+
+				fprintf(f, "%s:", fgArrays[ai].label);
+				for (UInt32 fi = 0; fi < numFloats; fi++)
+				{
+					__try {
+						fprintf(f, " %.6f", fdata[fi]);
+					} __except(EXCEPTION_EXECUTE_HANDLER) {
+						fprintf(f, " NaN");
+						break;
+					}
+				}
+				fprintf(f, "\n");
+			}
+			else
+			{
+				fprintf(f, "%s: (unavailable)\n", fgArrays[ai].label);
+			}
+		}
+		__except(EXCEPTION_EXECUTE_HANDLER) {
+			fprintf(f, "%s: (exception)\n", fgArrays[ai].label);
+		}
+	}
+
+	fprintf(f, "\n");
+}
+
+// ============================================================================
+// Main Dump Orchestrator
+// ============================================================================
+
+static void DumpSaveData(const char* savePath)
+{
+	_MESSAGE("DumpSaveData: starting dump...");
+
+	PlayerCharacter* player = *g_thePlayer;
+	if (!player) {
+		_MESSAGE("DumpSaveData: player is null, skipping");
+		return;
+	}
+
+	// Build output path: My Documents\My Games\Oblivion\OBSE\save_dump.txt
+	char dumpPath[MAX_PATH];
+	if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, dumpPath))) {
+		// Ensure the OBSE directory exists
+		char dirPath[MAX_PATH];
+		strcpy_s(dirPath, MAX_PATH, dumpPath);
+		strcat_s(dirPath, MAX_PATH, "\\My Games\\Oblivion\\OBSE");
+		CreateDirectoryA(dirPath, NULL);
+		strcat_s(dumpPath, MAX_PATH, "\\My Games\\Oblivion\\OBSE\\save_dump.txt");
+	}
+	else {
+		// Fallback
+		strcpy_s(dumpPath, MAX_PATH, "save_dump.txt");
+	}
+
+	// --- Read varla.ini config (auto-generate if missing) ---
+	char iniPath[MAX_PATH];
+	bool hasIni = GetVarlaIniPath(iniPath, sizeof(iniPath));
+	if (hasIni) {
+		DWORD attrs = GetFileAttributesA(iniPath);
+		if (attrs == INVALID_FILE_ATTRIBUTES) {
+			_MESSAGE("varla.ini not found, generating default config at: %s", iniPath);
+			GenerateDefaultVarlaIni(iniPath);
+		}
+	}
+
+	const char* ini = hasIni ? iniPath : "";
+	const char* sec = "SaveDump";
+
+	UInt32 bDumpPlayerCharacter  = hasIni ? GetPrivateProfileIntA(sec, "bDumpPlayerCharacter", 1, ini)  : 1;
+	UInt32 bDumpAppearance       = hasIni ? GetPrivateProfileIntA(sec, "bDumpAppearance", 0, ini)       : 1;
+	UInt32 bDumpPosition         = hasIni ? GetPrivateProfileIntA(sec, "bDumpPosition", 0, ini)         : 1;
+	UInt32 bDumpCharacterInfo    = hasIni ? GetPrivateProfileIntA(sec, "bDumpCharacterInfo", 0, ini)    : 1;
+	UInt32 bDumpFameInfamy       = hasIni ? GetPrivateProfileIntA(sec, "bDumpFameInfamy", 0, ini)       : 1;
+	UInt32 bDumpGameTime         = hasIni ? GetPrivateProfileIntA(sec, "bDumpGameTime", 0, ini)         : 1;
+	UInt32 bDumpGlobalVars       = hasIni ? GetPrivateProfileIntA(sec, "bDumpGlobalVars", 0, ini)       : 1;
+	UInt32 bDumpMiscStats        = hasIni ? GetPrivateProfileIntA(sec, "bDumpMiscStats", 0, ini)        : 1;
+	UInt32 bDumpActiveQuest      = hasIni ? GetPrivateProfileIntA(sec, "bDumpActiveQuest", 0, ini)      : 1;
+	UInt32 bDumpQuestList        = hasIni ? GetPrivateProfileIntA(sec, "bDumpQuestList", 0, ini)        : 1;
+	UInt32 bDumpQuestScriptVars  = hasIni ? GetPrivateProfileIntA(sec, "bDumpQuestScriptVars", 0, ini)  : 1;
+	UInt32 bDumpFactions         = hasIni ? GetPrivateProfileIntA(sec, "bDumpFactions", 0, ini)         : 1;
+	UInt32 bDumpAttributes       = hasIni ? GetPrivateProfileIntA(sec, "bDumpAttributes", 0, ini)       : 1;
+	UInt32 bDumpDerivedStats     = hasIni ? GetPrivateProfileIntA(sec, "bDumpDerivedStats", 0, ini)     : 1;
+	UInt32 bDumpSkills           = hasIni ? GetPrivateProfileIntA(sec, "bDumpSkills", 0, ini)           : 1;
+	UInt32 bDumpMagicResist      = hasIni ? GetPrivateProfileIntA(sec, "bDumpMagicResist", 0, ini)      : 1;
+	UInt32 bDumpSpells           = hasIni ? GetPrivateProfileIntA(sec, "bDumpSpells", 0, ini)           : 1;
+	UInt32 bDumpInventory        = hasIni ? GetPrivateProfileIntA(sec, "bDumpInventory", 0, ini)        : 1;
+	UInt32 bDumpActiveMagicEffects = hasIni ? GetPrivateProfileIntA(sec, "bDumpActiveMagicEffects", 0, ini) : 1;
+	UInt32 bDumpStatusEffects    = hasIni ? GetPrivateProfileIntA(sec, "bDumpStatusEffects", 0, ini)    : 1;
+	UInt32 bDumpSkillProgress    = hasIni ? GetPrivateProfileIntA(sec, "bDumpSkillProgress", 0, ini)    : 1;
+	UInt32 bDumpAVModifiers      = hasIni ? GetPrivateProfileIntA(sec, "bDumpAVModifiers", 0, ini)      : 1;
+	UInt32 bDumpQuickKeys        = hasIni ? GetPrivateProfileIntA(sec, "bDumpQuickKeys", 0, ini)        : 1;
+	UInt32 bDumpCellItems        = hasIni ? GetPrivateProfileIntA(sec, "bDumpCellItems", 0, ini)        : 1;
+	UInt32 bDumpPluginList       = hasIni ? GetPrivateProfileIntA(sec, "bDumpPluginList", 0, ini)       : 1;
+
+	_MESSAGE("varla.ini config loaded: PlayerChar=%d Appear=%d Pos=%d CharInfo=%d Fame=%d Time=%d Globals=%d Misc=%d Quest=%d QList=%d QScriptVars=%d Factions=%d Attr=%d Derived=%d Skills=%d MRes=%d Spells=%d Inv=%d AME=%d Status=%d SkillProg=%d AVMod=%d QKeys=%d Cell=%d Plugins=%d",
+		bDumpPlayerCharacter, bDumpAppearance, bDumpPosition, bDumpCharacterInfo,
+		bDumpFameInfamy, bDumpGameTime, bDumpGlobalVars,
+		bDumpMiscStats, bDumpActiveQuest, bDumpQuestList, bDumpQuestScriptVars,
+		bDumpFactions, bDumpAttributes, bDumpDerivedStats, bDumpSkills,
+		bDumpMagicResist, bDumpSpells, bDumpInventory,
+		bDumpActiveMagicEffects, bDumpStatusEffects,
+		bDumpSkillProgress, bDumpAVModifiers, bDumpQuickKeys,
+		bDumpCellItems, bDumpPluginList);
+
+	FILE* f = NULL;
+	if (fopen_s(&f, dumpPath, "w") != 0 || !f) {
+		_MESSAGE("DumpSaveData: failed to open %s for writing", dumpPath);
+		return;
+	}
+
+	__try {
+		// Header (always written, includes difficulty + character summary)
+		DumpHeader(f, savePath, player);
+
+		// Section order matching obse64
+		if (bDumpPlayerCharacter)    DumpPlayerCharacter(f, player);
+		if (bDumpAppearance)         DumpAppearance(f, player);
+		if (bDumpPosition)           DumpPosition(f, player);
+		if (bDumpCharacterInfo)      DumpCharacterInfo(f, player);   // includes EquippedItems
+		if (bDumpFameInfamy)         DumpFameInfamyBounty(f, player);
+		if (bDumpGameTime)           DumpGameTime(f);
+		if (bDumpGlobalVars)         DumpGlobalVariables(f);
+		if (bDumpMiscStats)          DumpMiscStats(f, player);
+		if (bDumpActiveQuest)        DumpActiveQuest(f, player);
+		if (bDumpQuestList)          DumpQuestList(f);
+		if (bDumpQuestScriptVars)    DumpQuestScriptVars(f);
+		if (bDumpFactions)           DumpFactions(f, player);
+		if (bDumpAttributes)         DumpAttributes(f, player);
+		if (bDumpDerivedStats)       DumpDerivedStats(f, player);
+		if (bDumpSkills)             DumpSkills(f, player);
+		if (bDumpMagicResist)        DumpMagicResist(f, player);
+		if (bDumpSpells)             DumpKnownSpells(f, player);
+		if (bDumpInventory)          DumpInventory(f, player);       // includes InventoryDetail
+		if (bDumpActiveMagicEffects) DumpActiveEffects(f, player);
+		if (bDumpStatusEffects)      DumpStatusEffects(f, player);
+		if (bDumpSkillProgress)      DumpSkillProgress(f, player);
+		if (bDumpAVModifiers)        DumpAVModifiers(f, player);
+		if (bDumpQuickKeys)          DumpQuickKeys(f);
+		if (bDumpCellItems)          DumpCellItems(f, player);
+		if (bDumpPluginList)         DumpPluginList(f);
+
+		// Footer
+		fprintf(f, "================================================================================\n");
+		fprintf(f, "END OF SAVE DATA DUMP\n");
+		fprintf(f, "================================================================================\n");
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		fprintf(f, "\n*** EXCEPTION CAUGHT DURING DUMP ***\n");
+		_MESSAGE("DumpSaveData: exception caught during dump");
+	}
+
+	fclose(f);
+	_MESSAGE("DumpSaveData: dump written to %s", dumpPath);
+}
+
+// ============================================================================
+// ExportSaveDump Command Handler
+// ============================================================================
+
+static bool Cmd_ExportSaveDump_Execute(COMMAND_ARGS)
+{
+	*result = 0;
+
+	_MESSAGE("ExportSaveDump: command invoked");
+	Console_Print("ExportSaveDump: starting dump...");
+
+	DumpSaveData("(manual export via ExportSaveDump command)");
+
+	Console_Print("ExportSaveDump: dump written to save_dump.txt");
+	*result = 1;
+	return true;
+}
+
+#endif  // OBLIVION (ExportSaveDump)
 
 // ============================================================================
 // ImportSaveDump - reads target.txt and applies values to the player
@@ -2554,6 +4542,21 @@ static CommandInfo kCommandInfo_ImportSaveDump =
 	0
 };
 
+static CommandInfo kCommandInfo_ExportSaveDump =
+{
+	"ExportSaveDump",
+	"",
+	0,
+	"Export player data to save_dump.txt",
+	0,
+	0,
+	NULL,
+	HANDLER(Cmd_ExportSaveDump_Execute),
+	NULL,
+	NULL,
+	0
+};
+
 // ---- Plugin entry points ----
 
 extern "C" {
@@ -2596,6 +4599,8 @@ bool OBSEPlugin_Load(const OBSEInterface * obse)
 	obse->SetOpcodeBase(0x2800);
 	obse->RegisterCommand(&kCommandInfo_ImportSaveDump);
 	_MESSAGE("varla_import: ImportSaveDump registered");
+	obse->RegisterCommand(&kCommandInfo_ExportSaveDump);
+	_MESSAGE("varla_import: ExportSaveDump registered");
 
 	if(!obse->isEditor)
 	{

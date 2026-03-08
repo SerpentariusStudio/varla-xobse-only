@@ -105,6 +105,7 @@
     <ClCompile Include="..\obse\obse\GameData.cpp" />
     <ClCompile Include="..\obse\obse\GameExtraData.cpp" />
     <ClCompile Include="..\obse\obse\GameForms.cpp" />
+    <ClCompile Include="..\obse\obse\GameMagicEffects.cpp" />
     <ClCompile Include="..\obse\obse\GameObjects.cpp" />
     <ClCompile Include="..\obse\obse\GameTasks.cpp" />
     <ClCompile Include="..\obse\obse\GameTypes.cpp" />
@@ -132,6 +133,7 @@
     <ClInclude Include="..\obse\obse\GameData.h" />
     <ClInclude Include="..\obse\obse\GameExtraData.h" />
     <ClInclude Include="..\obse\obse\GameForms.h" />
+    <ClInclude Include="..\obse\obse\GameMagicEffects.h" />
     <ClInclude Include="..\obse\obse\GameObjects.h" />
     <ClInclude Include="..\obse\obse\GameTasks.h" />
     <ClInclude Include="..\obse\obse\GameTypes.h" />
