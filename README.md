@@ -2,24 +2,24 @@
 
 ![Varla Stone](stone.png)
 
-An OBSE plugin that imports character data from Oblivion Remastered (or original Oblivion) into The Elder Scrolls IV: Oblivion.
+An OBSE plugin that imports character data from one save to another save in The Elder Scrolls IV: Oblivion.
 
-It reads a text-based save dump file and applies the character data to the current player, allowing you to transfer your character between Oblivion Remastered and original Oblivion.
+It reads a text-based save dump file and applies the character data to the current player.
 
 ## What it does
 
 The plugin registers two script commands:
 
-- **`ExportSaveDump`** — exports the current player's data to `save_dump.txt`
-- **`ImportSaveDump`** — imports character data from `target.txt` into the current player
+- **`ExportSave`** — exports the current player's data to `save_dump.txt`
+- **`ImportSave`** — imports character data from `target.txt` into the current player
 
-### ExportSaveDump
+### ExportSave
 
 Dumps the current player's character data to `My Documents\My Games\Oblivion\OBSE\save_dump.txt`. The export is controlled by `varla.ini` in the same folder — each section can be toggled on/off. If `varla.ini` doesn't exist, a default one is generated with `bDumpPlayerCharacter=1` and all other sections disabled.
 
 Exported sections include: player identity, appearance (hair, eyes, FaceGen morphs), position, character info (class, race, birthsign, equipped items), fame/infamy/bounty, game time, global variables, misc statistics, active quest, quest list, quest script variables, factions, attributes, derived stats, skills, magic resistances, spells (including player-created), inventory (including player-created potions), active magic effects, status effects, skill XP progress, AV modifiers, quick keys, cell items, and plugin list.
 
-### ImportSaveDump
+### ImportSave
 
 When called (via console or spell script), it reads `target.txt` from your OBSE data folder and applies the following to the current player:
 
@@ -73,17 +73,17 @@ This is a plain text dump with `=== SECTION NAME ===` headers. It's designed to 
 ### Export (via console)
 Open the console (`~`) and type:
 ```
-ExportSaveDump
+ExportSave
 ```
 This writes `save_dump.txt` to your OBSE data folder.
 
 ### Import (via console)
 ```
-ImportSaveDump
+ImportSave
 ```
 
 ### Via spell script
-Create a spell with a script effect that calls `ImportSaveDump` or `ExportSaveDump`. The return value is the number of fields that were changed (import) or 1 on success (export).
+Create a spell with a script effect that calls `ImportSave` or `ExportSave`. The return value is the number of fields that were changed (import) or 1 on success (export).
 
 ## Building from source
 
