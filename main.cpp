@@ -4529,7 +4529,7 @@ bool Cmd_ImportSaveDump_Execute(COMMAND_ARGS)
 // ---- Command definition ----
 static CommandInfo kCommandInfo_ImportSaveDump =
 {
-	"ImportSaveDump",
+	"ImportSave",
 	"",
 	0,
 	"Reads target.txt and applies values to the player",
@@ -4544,7 +4544,7 @@ static CommandInfo kCommandInfo_ImportSaveDump =
 
 static CommandInfo kCommandInfo_ExportSaveDump =
 {
-	"ExportSaveDump",
+	"ExportSave",
 	"",
 	0,
 	"Export player data to save_dump.txt",
@@ -4598,9 +4598,9 @@ bool OBSEPlugin_Load(const OBSEInterface * obse)
 	// Use opcode base 0x2800 (private/development range)
 	obse->SetOpcodeBase(0x2800);
 	obse->RegisterCommand(&kCommandInfo_ImportSaveDump);
-	_MESSAGE("varla_import: ImportSaveDump registered");
+	_MESSAGE("varla_import: ImportSave registered");
 	obse->RegisterCommand(&kCommandInfo_ExportSaveDump);
-	_MESSAGE("varla_import: ExportSaveDump registered");
+	_MESSAGE("varla_import: ExportSave registered");
 
 	if(!obse->isEditor)
 	{
